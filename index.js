@@ -1,9 +1,11 @@
 // ==UserScript==
 // @name         B站字幕 · UP主信息下方
 // @namespace    https://local/bili-subtitle
-// @version      1.5.0
-// @description  在哔哩哔哩视频播放页的UP主信息与弹幕列表之间显示字幕（wbi 签名 API + 播放器请求嗅探双通路），支持点击跳转、跟随高亮、搜索、复制、下载
+// @version      1.5.2
+// @description  在哔哩哔哩视频播放页的UP主信息下方显示字幕（wbi 签名 API + 播放器请求嗅探双通路），支持点击跳转、跟随高亮、搜索、复制、下载；隐藏原弹幕区块
 // @author       local
+// @updateURL    https://raw.githubusercontent.com/qinshuxiang/Tampermonkey/main/index.js
+// @downloadURL  https://raw.githubusercontent.com/qinshuxiang/Tampermonkey/main/index.js
 // @match        https://www.bilibili.com/video/*
 // @match        https://www.bilibili.com/list/*
 // @match        https://www.bilibili.com/bangumi/play/*
@@ -224,12 +226,18 @@
         return Number.isFinite(n) && n > 0 ? n : 1;
     }
 
-    // 换视频判定键：完整路径 + 白名单查询参数。
+    // 换视频判定键：完整路径 + 关键查询参数。
+    //
     // 不能全量用 location.search —— 播放器会随进度改写 ?t=，那不是换视频；
     // 也不能只用 bvid —— 番剧/合集页没有 bvid，换集时 key 不变会导致不重载字幕。
+    //
+    // 【1.5.1】白名单补齐 bvid / aid / oid / ep_id / season_id：
+    // 旧版只留 p / ep / ss，/list/ 播放列表靠 ?bvid= 换集、番剧页靠 ?ep_id= 换集，
+    // 这两种路径下路径不变、p 也不变，key 恒等 → 换集后永远不刷新字幕。
+    const ROUTE_KEEP = ['p', 'bvid', 'aid', 'oid', 'ep', 'ep_id', 'ss', 'season_id'];
     function routeKey() {
         const sp = new URLSearchParams(location.search);
-        const kept = ['p', 'ep', 'ss'].map(k => sp.get(k) ? `${k}=${sp.get(k)}` : '').filter(Boolean);
+        const kept = ROUTE_KEEP.map(k => sp.get(k) ? `${k}=${sp.get(k)}` : '').filter(Boolean);
         return location.pathname + (kept.length ? `?${kept.join('&')}` : '');
     }
 
@@ -533,14 +541,7 @@
         };
 
         // 整行可点收起；按钮文案改成右下角箭头指示，省掉一格宽度
-        const toggleCollapse = () => {
-            state.collapsed = !state.collapsed;
-            els.caret.textContent = state.collapsed ? '▸' : '▾';
-            els.wrap.classList.toggle('collapsed', state.collapsed);
-            if (MODE === 'float') floatify();
-            else els.host.style.height = state.collapsed ? 'auto' : panelH + 'px';
-        };
-        els.hd.addEventListener('click', toggleCollapse);
+        els.hd.addEventListener('click', () => setCollapsed(!state.collapsed));
 
         els.lang.addEventListener('change', () => loadTrack(Number(els.lang.value)));
 
@@ -607,6 +608,18 @@
         });
 
         return host;
+    }
+
+    // 收起 / 展开的唯一入口。
+    // 【1.5.1】抽成函数是因为切视频时也要强制展开（见 tick），
+    // 旧实现只有点击标题这一个入口，收起状态会一路带到下一个视频。
+    function setCollapsed(next) {
+        if (!els) return;
+        state.collapsed = !!next;
+        els.caret.textContent = state.collapsed ? '▸' : '▾';
+        els.wrap.classList.toggle('collapsed', state.collapsed);
+        if (MODE === 'float') floatify();
+        else els.host.style.height = state.collapsed ? 'auto' : panelH + 'px';
     }
 
     // 转义：字幕文本要进 innerHTML，不转义会被当标签解析
@@ -946,12 +959,15 @@
         }
     }
 
-    let running = null;
+    // 记录每个 revision 的失败原因，换集后卡住时才能知道断在哪一步
+    const runState = { revision: -1, inFlight: false };
+
     async function run() {
         const revision = state.revision;
-        if (running === revision) return;
+        if (runState.inFlight && runState.revision === revision) return;
         if (!/\/video\/|\/list\/|\/bangumi\/play\//.test(location.pathname)) return;
-        running = revision;
+        runState.revision = revision;
+        runState.inFlight = true;
         try {
             let note = '';
 
@@ -1006,7 +1022,7 @@
             console.error(e);
             msg(`出错了：${e.message}`);
         } finally {
-            if (running === revision) running = null;
+            if (runState.revision === revision) runState.inFlight = false;
         }
     }
 
@@ -1025,6 +1041,29 @@
     // 运行时可变：verifyLayout 兜底切到悬浮后同步更新（问题 8），
     // 否则收起/高度调整仍按 above 处理 fixed 面板，两套定位互相打架。
     let MODE = 'above';
+
+    /* ======================================================================
+     * 隐藏 B 站弹幕区块（1.5.2 新增，编号不占用挂载章节）
+     * ==================================================================== */
+    // 【1.5.2】用户要求：整块 #danmukuBox（标题栏 + 弹幕列表 + 发送框）不显示，
+    // 侧栏空间让给字幕面板。这里只做 display:none，不删除节点、不改 DOM 结构。
+    //
+    // 两个约束：
+    //   1. 必须保留节点。tick 的存活判定、pageMounted 的兜底条件、aboveify 的
+    //      兄弟节点校验都以 #danmukuBox 存在为前提，删了它整套挂载逻辑会停摆。
+    //   2. 只在非 dock 模式生效。dock 靠 box.getBoundingClientRect() 定位，
+    //      display:none 之后 rect 全为 0，面板会被甩到视口左上角。
+    //
+    // 用内联 style 而不是加 class：B 站重渲染会重置内联样式，但不会留下优先级
+    // 更高的选择器来覆盖；每次 tick 重新钉一次即可（tick 由 MutationObserver +
+    // 1.5s 巡检驱动，重渲染后 300ms 内就能重新隐藏）。
+    const HIDE_DANMAKU_BOX = true;
+    function hideDanmakuBox() {
+        if (!HIDE_DANMAKU_BOX || MODE === 'dock') return;
+        const box = document.getElementById('danmukuBox');
+        if (!box) return;
+        if (box.style.display !== 'none') box.style.display = 'none';
+    }
 
     // 面板高度（px）：不再写死。默认 320，用户可在面板右上角下拉里调，
     // 选择写入 localStorage（键 biliSubtitlePanelHeight），下次打开自动恢复。
@@ -1053,9 +1092,11 @@
         if (els.host.nextElementSibling !== box || els.host.parentElement !== box.parentElement) {
             box.parentElement.insertBefore(els.host, box);
         }
-        // 只在样式真的变化时才写，避免每帧触发样式重算
+        // 只在样式真的变化时才写，避免每帧触发样式重算。
+        // flex:0 0 auto 是必需的：侧栏若被 B 站改成 flex 容器，
+        // 单写 height 会被 flex-shrink 压扁成一条，看起来就像字幕没了。
         const css =
-            `display:block; position:relative; z-index:10; box-sizing:border-box;` +
+            `display:block; position:relative; z-index:10; box-sizing:border-box; flex:0 0 auto;` +
             `height:${state.collapsed ? 'auto' : panelH + 'px'}; margin:0 0 10px 0;`;
         if (css !== aboveCss) { aboveCss = css; els.host.style.cssText = css; }
     }
@@ -1092,35 +1133,36 @@
         if (els.host.parentElement !== document.body) document.body.appendChild(els.host);
     }
 
-    // 布局自检：既看高度，也看**水平位置**。
-    // 只查高度会漏掉"面板被挤出视口"的情况 —— 那种情况高度完全正常却看不见。
+    // 布局自检：只判断"面板是否真的完全看不见"，不再把"列表区太矮"当异常。
+    //
+    // 【1.5.1 关键修复】旧实现用 `bd.clientHeight < 80 || hR.height < 80` 判定异常，
+    // 一旦成立就把 MODE 永久改成 'float'。切视频时面板正被 B 站重排（或被收起），
+    // 这个测量必然偏小 → 面板被甩到右下角，且 MODE 再也不回 'above'。
+    // 现象就是"切下一集后字幕跑到角落"，用户只能看到一个标题条。
+    // 现在只有"面板连尺寸都没有 / 完全在视口外"才重插一次，重插仍无效才退悬浮。
     let layoutChecked = false;
     function verifyLayout() {
         if (layoutChecked || !els) return;
         layoutChecked = true;
         requestAnimationFrame(() => {
-            if (!els) return;
-            const bd = els.bd, bdR = bd.getBoundingClientRect();
+            if (!els || MODE !== 'above' || state.collapsed) return;
             const hR = els.host.getBoundingClientRect();
-            const box = document.getElementById('danmukuBox');
-            const boxR = box ? box.getBoundingClientRect() : null;
-            const vis = bdR.bottom > 0 && bdR.top < innerHeight && bdR.right > 0 && bdR.left < innerWidth;
-            LOG(`布局自检 mode=${MODE} 列表区 ${bd.clientHeight}px / ${state.cues.length} 条`);
-            LOG(`  面板 rect: x=${Math.round(hR.left)} y=${Math.round(hR.top)} ` +
-                `w=${Math.round(hR.width)} h=${Math.round(hR.height)}`);
-            LOG(`  视口 ${innerWidth}x${innerHeight}` +
-                (boxR ? ` / #danmukuBox x=${Math.round(boxR.left)} w=${Math.round(boxR.width)}` : ''));
-
-            const tooSmall = bd.clientHeight < 80 || hR.height < 80;
-            // 上方模式在正常文档流里，不需要检查视口越界（页面会把它推下去）
-            const outOfView = MODE !== 'above' && (!vis ||
-                hR.right < 0 || hR.left > innerWidth || hR.bottom < 0 || hR.top > innerHeight);
-
-            if (tooSmall || outOfView) {
-                LOG(`⚠️ 布局异常（高度不足=${tooSmall} 越出视口=${outOfView}），切到右下角悬浮`);
-                MODE = 'float';   // 同步运行时模式，收起/高度调整此后也按悬浮处理
-                floatify();
+            if (hR.width < 1 || hR.height < 1) {
+                LOG(`布局自检：面板尺寸为零（${Math.round(hR.width)}x${Math.round(hR.height)}），重插一次`);
+                aboveCss = '';
+                aboveify();
+                setTimeout(() => {
+                    if (!els || MODE !== 'above') return;
+                    const r2 = els.host.getBoundingClientRect();
+                    if (r2.width < 1 || r2.height < 1) {
+                        LOG('重插无效，改用右下角悬浮');
+                        MODE = 'float';
+                        floatify();
+                    }
+                }, 400);
+                return;
             }
+            LOG(`布局自检 mode=${MODE} 面板 ${Math.round(hR.width)}x${Math.round(hR.height)} / ${state.cues.length} 条`);
         });
     }
 
@@ -1135,17 +1177,29 @@
             const app = W.document.getElementById('app');
             return !!app?.__vue__;
         }
-        return false;
+        // 【1.5.1】等不到 Vue 标记就不再无限等：SPA 换集时 header 可能整体重建，
+        // __vue__ 一时取不到，死等会让 tick 永远走不到取字幕那一步。
+        // 页面已经 document-end 满 4 秒、且弹幕容器已存在，就认定可以插入。
+        return document.readyState === 'complete'
+            && performance.now() > 4000
+            && !!document.getElementById('danmukuBox');
     }
 
     function mount() {
-        if (MODE === 'above' && !pageMounted()) {
-            scheduleTick();
-            return false;
-        }
+        // 这里不再自己 scheduleTick：页面还没挂载完时由 1.5s 巡检兜底，
+        // 否则每次失败都排一个 300ms 定时器，会和巡检叠成无限空转。
+        if (MODE === 'above' && !pageMounted()) return false;
         const box = document.getElementById('danmukuBox');
         if (MODE !== 'float' && !box) return false;
-        if (els && els.host.isConnected) return true;   // 已经在页面里了
+        if (els && els.host.isConnected) {
+            // 已在页面里，但不代表位置还对：B 站重排侧栏时可能把它留在
+            // 推荐区/旧容器里。above 模式下一步校验兄弟节点，错了就重插。
+            if (MODE === 'above' && box && els.host.nextElementSibling !== box) {
+                aboveCss = '';
+                aboveify();
+            }
+            return true;
+        }
         if (!els) buildPanel();                          // 只有首次才构建（保留状态与监听）
         // 三种模式都只操作我们自己的节点，不改动 B 站任何元素的样式
         if (MODE === 'above') aboveify();
@@ -1155,12 +1209,20 @@
     }
 
     let lastKey = '';
+    let mountMiss = 0;   // 连续没找到 #danmukuBox 的次数，用来给即时重试封顶
     function tick() {
         if (location.hostname !== 'www.bilibili.com') return;
-        if (MODE !== 'float' && !document.getElementById('danmukuBox')) return;
-        // 先确保挂载（面板被 B 站重渲染移除时会重新插回），再做换视频判断。
-        // 注意不能"面板已存在就 return"—— 那样 SPA 切到下一个视频时永远不会去取新字幕。
+        // 切集瞬间 B 站会重建侧栏，#danmukuBox 短暂不存在。
+        // 【1.5.1】旧实现直接 return 且不重试，那一次排空之后就再没人来叫醒它。
+        if (MODE !== 'float' && !document.getElementById('danmukuBox')) {
+            if (mountMiss++ < 8) scheduleTick();   // 前 8 次（约 2.4s）走快速重试，之后交给巡检
+            return;
+        }
+        mountMiss = 0;
         if (!mount()) return;
+        // 放在 key 判定之前：切集、展开简介等重渲染都会重建 #danmukuBox，
+        // 若放在后面，同一视频内的重渲染就没人再钉一次 display 了。
+        hideDanmakuBox();
 
         const key = routeKey();
         if (key === lastKey) return;
@@ -1175,6 +1237,9 @@
         layoutChecked = false;       // 每个视频重新做一次布局自检（问题 11）
         loadSeq++;                   // 使在途的旧轨道加载结果失效（问题 7 配套）
         els.generate.hidden = true; els.cancel.hidden = true;
+        // 【1.5.1】新视频强制展开：收起状态会跨视频保留，
+        // 一旦用户收过一次，后面每集都只剩一条标题栏，看起来就是"字幕没了"。
+        setCollapsed(false);
         if (els) { els.q.value = ''; els.lang.innerHTML = ''; els.lang.hidden = true;
             msg('<span class="spin"></span>正在获取字幕…'); }
         run();
@@ -1198,6 +1263,13 @@
         const orig = history[m];
         history[m] = function (...a) { const r = orig.apply(this, a); scheduleTick(); return r; };
     }
+
+    // 【1.5.1】低频巡检兜底：B 站部分换集路径不经过 pushState/replaceState
+    // （自动连播、选集浮层直接改内部状态），MutationObserver 也可能在渲染完成前
+    // 就把 tick 消耗掉。1.5 秒一次的空跑只做几次 getElementById，代价可以忽略。
+    setInterval(() => {
+        if (document.visibilityState === 'visible') tick();
+    }, 1500);
 
     LOG(hasGM ? '启动（GM_xmlhttpRequest 可用，字幕正文走免 CORS 通路）'
         : '启动（⚠️ GM_xmlhttpRequest 不可用，字幕正文只能依赖嗅探）');
